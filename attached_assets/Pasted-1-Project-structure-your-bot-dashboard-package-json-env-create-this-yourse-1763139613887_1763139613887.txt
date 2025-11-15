@@ -1,0 +1,1596 @@
+1. Project structure
+your-bot-dashboard/
+├── package.json
+├── .env              # create this yourself
+├── server.js         # Node backend (Express + discord.js + OAuth2)
+├── data/
+│   ├── admins.json   # stored admin IDs
+│   └── manualCommands.json
+└── public/
+    ├── index.html    # Home + Commands + Admin (SPA style)
+    ├── styles.css
+    └── app.js
+
+2. Backend – package.json
+{
+  "name": "bot-dashboard",
+  "version": "1.0.0",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.0",
+    "dotenv": "^16.4.0",
+    "express": "^4.19.0",
+    "express-session": "^1.17.3",
+    "node-fetch": "^3.3.2",
+    "fs-extra": "^11.2.0",
+    "cors": "^2.8.5"
+  }
+}
+
+
+Install deps:
+
+npm install
+
+3. .env (you create this)
+DISCORD_BOT_TOKEN=your_bot_token_here
+DISCORD_APPLICATION_ID=your_application_id_here
+DISCORD_CLIENT_ID=your_oauth_client_id_here
+DISCORD_CLIENT_SECRET=your_oauth_client_secret_here
+DISCORD_REDIRECT_URI=http://localhost:3000/auth/discord/callback
+SESSION_SECRET=super_long_random_string_here
+PORT=3000
+
+
+In the Discord Developer Portal, add the redirect URI to
+OAuth2 → General → Redirects (must match DISCORD_REDIRECT_URI).
+
+4. Backend – server.js
+import 'dotenv/config';
+import express from 'express';
+import session from 'express-session';
+import cors from 'cors';
+import fetch from 'node-fetch';
+import { promises as fs } from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+import {
+  Client,
+  GatewayIntentBits,
+  Partials,
+} from 'discord.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// ---------- CONFIG ----------
+const {
+  DISCORD_BOT_TOKEN,
+  DISCORD_APPLICATION_ID,
+  DISCORD_CLIENT_ID,
+  DISCORD_CLIENT_SECRET,
+  DISCORD_REDIRECT_URI,
+  SESSION_SECRET,
+  PORT = 3000,
+} = process.env;
+
+const DEFAULT_ADMIN_ID = '510792663210131456';
+
+const DATA_DIR = path.join(__dirname, 'data');
+const ADMINS_FILE = path.join(DATA_DIR, 'admins.json');
+const MANUAL_COMMANDS_FILE = path.join(DATA_DIR, 'manualCommands.json');
+
+// ---------- DISCORD CLIENT (BOT) ----------
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+  ],
+  partials: [Partials.GuildMember],
+});
+
+// cached analytics-ish data (you can expand this)
+const analyticsCache = {
+  lastUpdated: null,
+  guildCount: 0,
+  totalMemberCount: 0, // will be approximate if you add more intents
+};
+
+// command usage logs – in-memory; you can persist if you want
+let commandLogs = [];
+
+// Hook this into your actual bot code: send logs to this server (see comment later)
+// For demo we'll just keep full control here.
+
+client.once('ready', async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+  await refreshAnalytics();
+});
+
+// ---------- HELPERS ----------
+async function ensureDataFiles() {
+  await fs.mkdir(DATA_DIR, { recursive: true });
+
+  try {
+    await fs.access(ADMINS_FILE);
+  } catch {
+    await fs.writeFile(ADMINS_FILE, JSON.stringify([DEFAULT_ADMIN_ID], null, 2));
+  }
+
+  try {
+    await fs.access(MANUAL_COMMANDS_FILE);
+  } catch {
+    await fs.writeFile(MANUAL_COMMANDS_FILE, JSON.stringify([], null, 2));
+  }
+}
+
+async function getAdmins() {
+  await ensureDataFiles();
+  const raw = await fs.readFile(ADMINS_FILE, 'utf8');
+  return JSON.parse(raw);
+}
+
+async function saveAdmins(admins) {
+  await fs.writeFile(ADMINS_FILE, JSON.stringify(admins, null, 2));
+}
+
+async function getManualCommands() {
+  await ensureDataFiles();
+  const raw = await fs.readFile(MANUAL_COMMANDS_FILE, 'utf8');
+  return JSON.parse(raw);
+}
+
+async function saveManualCommands(commands) {
+  await fs.writeFile(MANUAL_COMMANDS_FILE, JSON.stringify(commands, null, 2));
+}
+
+function isAdmin(userId, adminList) {
+  return adminList.includes(userId);
+}
+
+async function refreshAnalytics() {
+  analyticsCache.guildCount = client.guilds.cache.size;
+  analyticsCache.totalMemberCount = client.guilds.cache.reduce((acc, g) => acc + (g.memberCount ?? 0), 0);
+  analyticsCache.lastUpdated = new Date().toISOString();
+}
+
+// Convert Discord role color (integer) to HEX
+function intToHexColor(colorInt) {
+  if (!colorInt || colorInt === 0) return '#000000';
+  return `#${colorInt.toString(16).padStart(6, '0')}`;
+}
+
+// ---------- EXPRESS APP ----------
+const app = express();
+
+app.use(cors({
+  origin: true,
+  credentials: true,
+}));
+app.use(express.json());
+app.use(session({
+  secret: SESSION_SECRET || 'changeme',
+  resave: false,
+  saveUninitialized: false,
+}));
+
+// Serve static frontend
+app.use(express.static(path.join(__dirname, 'public')));
+
+// ---------- AUTH ROUTES (DISCORD OAUTH2) ----------
+
+// Step 1: redirect to Discord
+app.get('/auth/discord', (req, res) => {
+  const state = cryptoRandomString(32);
+  req.session.oauthState = state;
+
+  const params = new URLSearchParams({
+    client_id: DISCORD_CLIENT_ID,
+    redirect_uri: DISCORD_REDIRECT_URI,
+    response_type: 'code',
+    scope: 'identify',
+    state,
+    prompt: 'consent',
+  });
+
+  res.redirect(`https://discord.com/api/oauth2/authorize?${params.toString()}`);
+});
+
+// Step 2: Discord redirects back here
+app.get('/auth/discord/callback', async (req, res) => {
+  const { code, state } = req.query;
+
+  if (!code || !state || state !== req.session.oauthState) {
+    return res.status(400).send('Invalid OAuth state');
+  }
+
+  try {
+    const body = new URLSearchParams({
+      client_id: DISCORD_CLIENT_ID,
+      client_secret: DISCORD_CLIENT_SECRET,
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: DISCORD_REDIRECT_URI,
+    });
+
+    const tokenResponse = await fetch('https://discord.com/api/oauth2/token', {
+      method: 'POST',
+      body,
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+    });
+
+    const tokenData = await tokenResponse.json();
+
+    if (!tokenResponse.ok) {
+      console.error('Token error:', tokenData);
+      return res.status(500).send('OAuth token exchange failed');
+    }
+
+    const userResponse = await fetch('https://discord.com/api/users/@me', {
+      headers: {
+        Authorization: `${tokenData.token_type} ${tokenData.access_token}`,
+      },
+    });
+
+    const userData = await userResponse.json();
+
+    req.session.user = {
+      id: userData.id,
+      username: `${userData.username}#${userData.discriminator}`,
+      avatar: userData.avatar,
+    };
+
+    res.redirect('/#admin');
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('OAuth callback error');
+  }
+});
+
+app.post('/auth/logout', (req, res) => {
+  req.session.destroy(() => {
+    res.json({ success: true });
+  });
+});
+
+function requireAuth(req, res, next) {
+  if (!req.session.user) {
+    return res.status(401).json({ error: 'Not authenticated' });
+  }
+  next();
+}
+
+async function requireAdmin(req, res, next) {
+  if (!req.session.user) {
+    return res.status(401).json({ error: 'Not authenticated' });
+  }
+  const admins = await getAdmins();
+  if (!isAdmin(req.session.user.id, admins)) {
+    return res.status(403).json({ error: 'Not an admin' });
+  }
+  next();
+}
+
+// ---------- API ROUTES ----------
+
+// Current user (for frontend)
+app.get('/api/auth/me', async (req, res) => {
+  if (!req.session.user) {
+    return res.json({ user: null, isAdmin: false });
+  }
+  const admins = await getAdmins();
+  res.json({
+    user: req.session.user,
+    isAdmin: isAdmin(req.session.user.id, admins),
+  });
+});
+
+// Bot info for Home page
+app.get('/api/bot/info', (req, res) => {
+  if (!client.user) {
+    return res.status(503).json({ error: 'Bot not ready' });
+  }
+
+  res.json({
+    id: client.user.id,
+    tag: client.user.tag,
+    avatar: client.user.displayAvatarURL?.(),
+    guildCount: client.guilds.cache.size,
+  });
+});
+
+// Commands list (Discord + manual)
+app.get('/api/commands', async (req, res) => {
+  try {
+    const url = `https://discord.com/api/v10/applications/${DISCORD_APPLICATION_ID}/commands`;
+    const apiRes = await fetch(url, {
+      headers: {
+        Authorization: `Bot ${DISCORD_BOT_TOKEN}`,
+      },
+    });
+
+    const discordCommands = await apiRes.json();
+    const manualCommands = await getManualCommands();
+
+    const formatted = [
+      ...discordCommands.map(cmd => ({
+        source: 'discord',
+        id: cmd.id,
+        name: cmd.name,
+        description: cmd.description || '',
+        default_member_permissions: cmd.default_member_permissions,
+        dm_permission: cmd.dm_permission,
+        type: cmd.type,
+      })),
+      ...manualCommands.map(cmd => ({
+        source: 'manual',
+        ...cmd,
+      })),
+    ];
+
+    res.json(formatted);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch commands' });
+  }
+});
+
+// Admin: add manual command ("Sync & Fix")
+app.post('/api/admin/manual-command', requireAdmin, async (req, res) => {
+  const { name, description, permissions, dm_permission } = req.body;
+
+  if (!name) {
+    return res.status(400).json({ error: 'Name is required' });
+  }
+
+  const current = await getManualCommands();
+  const newCommand = {
+    id: `manual_${Date.now()}`,
+    name,
+    description: description || '',
+    permissions: permissions || null,
+    dm_permission: dm_permission ?? true,
+    type: 'manual',
+  };
+  current.push(newCommand);
+  await saveManualCommands(current);
+  res.json(newCommand);
+});
+
+// Admin: add other admins
+app.post('/api/admin/add-admin', requireAdmin, async (req, res) => {
+  const { userId } = req.body;
+  if (!userId) {
+    return res.status(400).json({ error: 'userId is required' });
+  }
+
+  const admins = await getAdmins();
+  if (!admins.includes(userId)) {
+    admins.push(userId);
+    await saveAdmins(admins);
+  }
+
+  res.json({ success: true, admins });
+});
+
+// Command logs (GET)
+app.get('/api/admin/command-logs', requireAdmin, (req, res) => {
+  res.json(commandLogs.slice(-200)); // latest 200
+});
+
+// Endpoint your bot can POST to when a command is used
+app.post('/api/bot/command-log', async (req, res) => {
+  // To keep this safe, add some sort of shared secret or IP allowlist.
+  const { userId, username, commandName, options, guildId, channelId } = req.body;
+
+  commandLogs.push({
+    timestamp: new Date().toISOString(),
+    userId,
+    username,
+    commandName,
+    options: options || {},
+    guildId,
+    channelId,
+  });
+
+  if (commandLogs.length > 1000) {
+    commandLogs = commandLogs.slice(-500);
+  }
+
+  res.json({ success: true });
+});
+
+// Analytics
+app.get('/api/admin/analytics', requireAdmin, async (req, res) => {
+  await refreshAnalytics();
+  res.json(analyticsCache);
+});
+
+// Server list
+app.get('/api/admin/guilds', requireAdmin, async (req, res) => {
+  const guilds = await Promise.all(
+    client.guilds.cache.map(async (g) => {
+      let owner = null;
+      try {
+        const fetchedOwner = await g.fetchOwner();
+        owner = {
+          id: fetchedOwner.id,
+          tag: fetchedOwner.user.tag,
+        };
+      } catch {
+        owner = null;
+      }
+
+      return {
+        id: g.id,
+        name: g.name,
+        icon: g.iconURL?.(),
+        owner,
+        roleCount: g.roles.cache.size,
+      };
+    })
+  );
+
+  res.json(guilds);
+});
+
+// Roles for a specific guild
+app.get('/api/admin/guilds/:id/roles', requireAdmin, async (req, res) => {
+  const guild = client.guilds.cache.get(req.params.id);
+  if (!guild) {
+    return res.status(404).json({ error: 'Guild not found' });
+  }
+
+  const roles = guild.roles.cache
+    .sort((a, b) => b.position - a.position)
+    .map(role => ({
+      id: role.id,
+      name: role.name,
+      color: intToHexColor(role.color),
+      position: role.position,
+    }));
+
+  res.json(roles);
+});
+
+// Fallback (SPA)
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// ---------- UTIL ----------
+function cryptoRandomString(length) {
+  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let out = '';
+  for (let i = 0; i < length; i++) {
+    out += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return out;
+}
+
+// ---------- START ----------
+await ensureDataFiles();
+
+app.listen(PORT, () => {
+  console.log(`Dashboard listening on http://localhost:${PORT}`);
+});
+
+client.login(DISCORD_BOT_TOKEN);
+
+5. Frontend – public/index.html
+
+Minimal, one-page layout with sections: Home, Commands, Admin.
+Placeholders are marked with data-placeholder attributes so you can Ctrl+F.
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title data-placeholder="site-title"><placeholder-name1> Bot Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- If you find Nobleprac's font, import it here and set in styles.css -->
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-left">
+      <span class="logo" data-placeholder="bot-short-name"><placeholder-name2>BotName</span>
+    </div>
+    <nav class="nav-links">
+      <button class="nav-link" data-nav="home">Home</button>
+      <button class="nav-link" data-nav="commands">Commands</button>
+      <button class="nav-link" data-nav="admin">Admin</button>
+    </nav>
+    <div class="topbar-right">
+      <button id="login-btn" class="btn ghost small">Login with Discord</button>
+      <div id="user-chip" class="user-chip hidden">
+        <span id="user-name"></span>
+        <button id="logout-btn" class="btn ghost tiny">Logout</button>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <!-- HOME -->
+    <section id="home" class="section visible">
+      <div class="hero">
+        <div class="hero-text">
+          <h1 data-placeholder="hero-title">
+            <placeholder-name3>Clean minimal dashboard for your Discord bot.</placeholder-name3>
+          </h1>
+          <p data-placeholder="hero-subtitle">
+            <placeholder-name4>
+              Describe what your bot does here – moderation, utility, music, whatever.
+            </placeholder-name4>
+          </p>
+          <div class="hero-actions">
+            <a href="#" id="invite-link" class="btn primary">Add Bot</a>
+            <button class="btn subtle" data-nav="commands">View Commands</button>
+          </div>
+          <div class="hero-meta">
+            <span id="bot-tag-label">Bot: …</span>
+            <span id="bot-guilds-label">Servers: …</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="about-grid">
+        <div class="card" data-placeholder="feature-1">
+          <h3>Fast & Minimal</h3>
+          <p>Modern, clean UI with zero clutter. Everything you need, nothing you don’t.</p>
+        </div>
+        <div class="card" data-placeholder="feature-2">
+          <h3>Live Commands</h3>
+          <p>Commands are synced directly from Discord’s API plus your manual fixes.</p>
+        </div>
+        <div class="card" data-placeholder="feature-3">
+          <h3>Admin Analytics</h3>
+          <p>Private admin area with server list, role explorer and command logs.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- COMMANDS -->
+    <section id="commands" class="section">
+      <header class="section-header">
+        <h2>Commands</h2>
+        <p>Auto-synced from your Discord application + manual fixes.</p>
+      </header>
+
+      <div class="commands-controls">
+        <input id="command-search" type="text" placeholder="Search commands…" />
+      </div>
+
+      <div id="commands-list" class="commands-list">
+        <!-- Filled by JS -->
+      </div>
+    </section>
+
+    <!-- ADMIN -->
+    <section id="admin" class="section">
+      <header class="section-header">
+        <h2>Admin Area</h2>
+        <p>Only specific Discord IDs can access this. You are the main admin.</p>
+      </header>
+
+      <div id="admin-locked" class="admin-locked">
+        <p>You must log in with Discord and be an admin to view this area.</p>
+        <button id="admin-login-btn" class="btn primary">Login with Discord</button>
+      </div>
+
+      <div id="admin-content" class="admin-grid hidden">
+        <!-- Analytics -->
+        <section class="admin-card">
+          <h3>Bot Analytics</h3>
+          <div id="analytics">
+            <p><strong>Guilds:</strong> <span data-analytics="guilds">–</span></p>
+            <p><strong>Approx users:</strong> <span data-analytics="members">–</span></p>
+            <p><strong>Last updated:</strong> <span data-analytics="updated">–</span></p>
+          </div>
+        </section>
+
+        <!-- Commands log -->
+        <section class="admin-card">
+          <h3>Commands log</h3>
+          <p class="small-text">This requires your bot to POST to <code>/api/bot/command-log</code>.</p>
+          <div id="command-logs" class="logs-list">
+            <!-- JS fills -->
+          </div>
+        </section>
+
+        <!-- Add admin -->
+        <section class="admin-card">
+          <h3>Add admin</h3>
+          <form id="add-admin-form" class="form-inline">
+            <input type="text" id="new-admin-id" placeholder="Discord user ID" />
+            <button class="btn primary" type="submit">Add</button>
+          </form>
+          <p class="small-text">Current main admin: <code>510792663210131456</code></p>
+        </section>
+
+        <!-- Sync & Fix (Manual commands) -->
+        <section class="admin-card">
+          <h3>Sync &amp; Fix (Manual commands)</h3>
+          <form id="manual-command-form" class="form-vertical">
+            <input type="text" id="mc-name" placeholder="Command name (no /)" required />
+            <input type="text" id="mc-desc" placeholder="Description" />
+            <input type="text" id="mc-perms" placeholder="Permissions (text, optional)" />
+            <label class="checkbox-inline">
+              <input type="checkbox" id="mc-dm" checked />
+              Available in DMs
+            </label>
+            <button class="btn primary" type="submit">Add manual command</button>
+          </form>
+        </section>
+
+        <!-- Server List -->
+        <section class="admin-card wide">
+          <h3>Server List</h3>
+          <div id="guilds-list" class="guilds-list">
+            <!-- JS fills -->
+          </div>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span data-placeholder="footer-text">
+      <placeholder-name5>© YourBotName – Dashboard.</placeholder-name5>
+    </span>
+  </footer>
+
+  <script src="/app.js" type="module"></script>
+</body>
+</html>
+
+6. Styles – public/styles.css
+
+Minimal, modern, hover effects on everything.
+For the font: once you inspect Nobleprac, replace the font-family line.
+
+:root {
+  --bg: #05060a;
+  --bg-alt: #0b0d14;
+  --card: #10131f;
+  --card-soft: #151827;
+  --accent: #4b82ff;
+  --accent-soft: rgba(75, 130, 255, 0.14);
+  --accent-strong: rgba(75, 130, 255, 0.26);
+  --border-subtle: rgba(255, 255, 255, 0.05);
+  --text: #f5f7ff;
+  --text-muted: #a1a6c3;
+  --danger: #ff5d73;
+  --radius-lg: 16px;
+  --radius-md: 10px;
+  --radius-sm: 6px;
+  --transition-fast: 150ms ease-out;
+  --shadow-soft: 0 18px 50px rgba(0, 0, 0, 0.65);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: radial-gradient(circle at top, #151825 0, #05060a 45%, #000 100%);
+  color: var(--text);
+  /* Replace this with Nobleprac's font once you know it */
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+}
+
+/* Top bar */
+
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 18px;
+  background: linear-gradient(to bottom, rgba(5, 6, 10, 0.95), rgba(5, 6, 10, 0.7));
+  backdrop-filter: blur(16px);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.topbar-left,
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.logo {
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-size: 0.9rem;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.nav-links {
+  display: flex;
+  gap: 8px;
+}
+
+.nav-link {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  padding: 6px 14px;
+  border-radius: 999px;
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast), transform var(--transition-fast);
+}
+
+.nav-link:hover {
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+  transform: translateY(-1px);
+}
+
+/* Buttons */
+
+.btn {
+  border: none;
+  border-radius: 999px;
+  padding: 9px 18px;
+  font-size: 0.88rem;
+  cursor: pointer;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  transition: background var(--transition-fast), color var(--transition-fast), box-shadow var(--transition-fast), transform var(--transition-fast);
+  white-space: nowrap;
+}
+
+.btn.primary {
+  background: var(--accent);
+  color: #fff;
+  box-shadow: 0 12px 35px rgba(75, 130, 255, 0.45);
+}
+
+.btn.primary:hover {
+  background: #6c96ff;
+  transform: translateY(-1px);
+  box-shadow: 0 18px 45px rgba(75, 130, 255, 0.6);
+}
+
+.btn.ghost {
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: var(--text-muted);
+}
+
+.btn.ghost:hover {
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+  transform: translateY(-1px);
+}
+
+.btn.subtle {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text);
+}
+
+.btn.subtle:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.btn.small {
+  padding: 7px 13px;
+  font-size: 0.8rem;
+}
+
+.btn.tiny {
+  padding: 5px 10px;
+  font-size: 0.75rem;
+}
+
+/* User chip */
+
+.user-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.user-chip span {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.hidden {
+  display: none !important;
+}
+
+/* Layout */
+
+main {
+  max-width: 1000px;
+  margin: 32px auto 48px;
+  padding: 0 16px;
+}
+
+.section {
+  display: none;
+}
+
+.section.visible {
+  display: block;
+}
+
+.section-header {
+  margin-bottom: 18px;
+}
+
+.section-header h2 {
+  margin: 0 0 6px;
+  font-size: 1.4rem;
+}
+
+.section-header p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.9rem;
+}
+
+/* Hero */
+
+.hero {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 26px 20px;
+  border-radius: var(--radius-lg);
+  background: radial-gradient(circle at top left, var(--accent-soft), transparent 55%),
+              radial-gradient(circle at bottom right, #141827, #070813);
+  box-shadow: var(--shadow-soft);
+  border: 1px solid var(--border-subtle);
+}
+
+.hero-text h1 {
+  margin: 0 0 10px;
+  font-size: 1.7rem;
+}
+
+.hero-text p {
+  margin: 0;
+  color: var(--text-muted);
+  max-width: 540px;
+  font-size: 0.95rem;
+}
+
+.hero-actions {
+  margin-top: 16px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.hero-meta {
+  margin-top: 14px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+/* About */
+
+.about-grid {
+  margin-top: 26px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px;
+}
+
+.card {
+  background: var(--card);
+  border-radius: var(--radius-md);
+  padding: 16px 14px;
+  border: 1px solid var(--border-subtle);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  transition: transform var(--transition-fast), box-shadow var(--transition-fast), border-color var(--transition-fast), background var(--transition-fast);
+}
+
+.card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.7);
+  border-color: rgba(255, 255, 255, 0.12);
+  background: var(--card-soft);
+}
+
+.card h3 {
+  margin: 0 0 6px;
+  font-size: 1rem;
+}
+
+.card p {
+  margin: 0;
+  font-size: 0.86rem;
+  color: var(--text-muted);
+}
+
+/* Commands */
+
+.commands-controls {
+  margin-bottom: 14px;
+}
+
+input[type="text"],
+input[type="search"] {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  background: rgba(3, 5, 12, 0.9);
+  color: var(--text);
+  font-size: 0.86rem;
+  outline: none;
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast), background var(--transition-fast), transform var(--transition-fast);
+}
+
+input[type="text"]:focus,
+input[type="search"]:focus {
+  border-color: var(--accent);
+  background: rgba(8, 10, 20, 0.96);
+  box-shadow: 0 0 0 1px var(--accent-soft), 0 12px 28px rgba(0, 0, 0, 0.8);
+  transform: translateY(-1px);
+}
+
+.commands-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 10px;
+}
+
+.command-card {
+  padding: 14px 12px;
+  border-radius: var(--radius-md);
+  background: var(--card);
+  border: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 0.85rem;
+  transition: transform var(--transition-fast), box-shadow var(--transition-fast), border-color var(--transition-fast), background var(--transition-fast);
+}
+
+.command-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.7);
+  border-color: rgba(255, 255, 255, 0.12);
+  background: var(--card-soft);
+}
+
+.command-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.command-name {
+  font-weight: 600;
+}
+
+.command-badge {
+  font-size: 0.7rem;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-muted);
+}
+
+.command-desc {
+  color: var(--text-muted);
+}
+
+/* Admin */
+
+.admin-locked {
+  padding: 16px 14px;
+  border-radius: var(--radius-md);
+  background: var(--card);
+  border: 1px dashed rgba(255, 255, 255, 0.12);
+  font-size: 0.88rem;
+  color: var(--text-muted);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.admin-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 1.1fr);
+  gap: 14px;
+}
+
+.admin-card {
+  padding: 14px 12px;
+  border-radius: var(--radius-md);
+  background: var(--card);
+  border: 1px solid var(--border-subtle);
+  font-size: 0.86rem;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.admin-card.wide {
+  grid-column: 1 / -1;
+}
+
+.small-text {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+
+.form-inline {
+  display: flex;
+  gap: 8px;
+}
+
+.form-inline input {
+  flex: 1;
+}
+
+.form-vertical {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.checkbox-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+/* Logs */
+
+.logs-list {
+  max-height: 260px;
+  overflow: auto;
+  padding-right: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.log-item {
+  padding: 7px 8px;
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  font-size: 0.78rem;
+}
+
+/* Guilds */
+
+.guilds-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.guild-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  font-size: 0.82rem;
+}
+
+.guild-main {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.guild-meta {
+  color: var(--text-muted);
+  font-size: 0.76rem;
+}
+
+.guild-roles {
+  margin-top: 6px;
+  padding: 8px;
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.45);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  font-size: 0.78rem;
+}
+
+.role-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  margin: 2px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.role-color-square {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+}
+
+/* Footer */
+
+.footer {
+  border-top: 1px solid rgba(255, 255, 255, 0.04);
+  padding: 12px 18px 16px;
+  text-align: center;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+/* Responsive */
+
+@media (max-width: 720px) {
+  .topbar {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .nav-links {
+    flex: 1 1 100%;
+    justify-content: center;
+  }
+  .admin-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+7. Frontend logic – public/app.js
+const sections = {
+  home: document.getElementById('home'),
+  commands: document.getElementById('commands'),
+  admin: document.getElementById('admin'),
+};
+
+function showSection(key) {
+  Object.entries(sections).forEach(([k, el]) => {
+    el.classList.toggle('visible', k === key);
+  });
+  window.location.hash = `#${key}`;
+}
+
+document.querySelectorAll('[data-nav]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const target = btn.getAttribute('data-nav');
+    showSection(target);
+  });
+});
+
+// Initial section
+const hash = window.location.hash.replace('#', '');
+if (sections[hash]) {
+  showSection(hash);
+} else {
+  showSection('home');
+}
+
+// ---------- Auth UI ----------
+const loginBtn = document.getElementById('login-btn');
+const adminLoginBtn = document.getElementById('admin-login-btn');
+const logoutBtn = document.getElementById('logout-btn');
+const userChip = document.getElementById('user-chip');
+const userNameEl = document.getElementById('user-name');
+
+loginBtn.addEventListener('click', () => {
+  window.location.href = '/auth/discord';
+});
+
+adminLoginBtn.addEventListener('click', () => {
+  window.location.href = '/auth/discord';
+});
+
+logoutBtn.addEventListener('click', async () => {
+  await fetch('/auth/logout', { method: 'POST', credentials: 'include' });
+  location.reload();
+});
+
+// Check auth state
+async function refreshAuthUI() {
+  const res = await fetch('/api/auth/me', { credentials: 'include' });
+  const data = await res.json();
+
+  if (data.user) {
+    loginBtn.classList.add('hidden');
+    userChip.classList.remove('hidden');
+    userNameEl.textContent = data.user.username;
+  } else {
+    loginBtn.classList.remove('hidden');
+    userChip.classList.add('hidden');
+  }
+
+  const adminLocked = document.getElementById('admin-locked');
+  const adminContent = document.getElementById('admin-content');
+
+  if (data.user && data.isAdmin) {
+    adminLocked.classList.add('hidden');
+    adminContent.classList.remove('hidden');
+    // Load admin data
+    loadAnalytics();
+    loadCommandLogs();
+    loadGuilds();
+  } else {
+    adminLocked.classList.remove('hidden');
+    adminContent.classList.add('hidden');
+  }
+}
+
+// ---------- Bot info for home ----------
+async function loadBotInfo() {
+  const tagEl = document.getElementById('bot-tag-label');
+  const guildsEl = document.getElementById('bot-guilds-label');
+  try {
+    const res = await fetch('/api/bot/info');
+    if (!res.ok) return;
+    const info = await res.json();
+    tagEl.textContent = `Bot: ${info.tag} (${info.id})`;
+    guildsEl.textContent = `Servers: ${info.guildCount}`;
+  } catch (err) {
+    console.error(err);
+  }
+}
+
+// ---------- Commands ----------
+const commandsListEl = document.getElementById('commands-list');
+const commandSearch = document.getElementById('command-search');
+let commandsCache = [];
+
+async function loadCommands() {
+  commandsListEl.innerHTML = '';
+  const loading = document.createElement('div');
+  loading.textContent = 'Loading commands…';
+  loading.className = 'small-text';
+  commandsListEl.appendChild(loading);
+
+  try {
+    const res = await fetch('/api/commands');
+    const data = await res.json();
+    commandsCache = data;
+    renderCommands();
+  } catch (err) {
+    console.error(err);
+    commandsListEl.innerHTML = '<p class="small-text">Failed to load commands.</p>';
+  }
+}
+
+function renderCommands() {
+  const query = commandSearch.value.trim().toLowerCase();
+  commandsListEl.innerHTML = '';
+
+  const filtered = commandsCache.filter(cmd => {
+    if (!query) return true;
+    return (
+      cmd.name.toLowerCase().includes(query) ||
+      (cmd.description || '').toLowerCase().includes(query)
+    );
+  });
+
+  if (!filtered.length) {
+    commandsListEl.innerHTML = '<p class="small-text">No commands match that search.</p>';
+    return;
+  }
+
+  for (const cmd of filtered) {
+    const card = document.createElement('div');
+    card.className = 'command-card';
+
+    const header = document.createElement('div');
+    header.className = 'command-card-header';
+
+    const name = document.createElement('div');
+    name.className = 'command-name';
+    name.textContent = `/${cmd.name}`;
+
+    const badge = document.createElement('span');
+    badge.className = 'command-badge';
+    badge.textContent = cmd.source === 'manual' ? 'Manual' : 'Discord';
+
+    header.appendChild(name);
+    header.appendChild(badge);
+
+    const desc = document.createElement('div');
+    desc.className = 'command-desc';
+    desc.textContent = cmd.description || 'No description set.';
+
+    const meta = document.createElement('div');
+    meta.className = 'command-meta';
+    meta.style.fontSize = '0.75rem';
+    meta.style.color = 'var(--text-muted)';
+    meta.innerHTML = `
+      <span>DM: ${cmd.dm_permission ? 'Yes' : 'No'}</span>
+      ·
+      <span>Type: ${cmd.type ?? 'slash'}</span>
+    `;
+
+    card.appendChild(header);
+    card.appendChild(desc);
+    card.appendChild(meta);
+
+    commandsListEl.appendChild(card);
+  }
+}
+
+commandSearch.addEventListener('input', () => renderCommands());
+
+// ---------- Admin: analytics ----------
+async function loadAnalytics() {
+  try {
+    const res = await fetch('/api/admin/analytics', { credentials: 'include' });
+    if (!res.ok) return;
+    const data = await res.json();
+    document.querySelector('[data-analytics="guilds"]').textContent = data.guildCount;
+    document.querySelector('[data-analytics="members"]').textContent = data.totalMemberCount;
+    document.querySelector('[data-analytics="updated"]').textContent = new Date(data.lastUpdated).toLocaleString();
+  } catch (err) {
+    console.error(err);
+  }
+}
+
+// ---------- Admin: command logs ----------
+const logsEl = document.getElementById('command-logs');
+
+async function loadCommandLogs() {
+  try {
+    const res = await fetch('/api/admin/command-logs', { credentials: 'include' });
+    if (!res.ok) return;
+    const logs = await res.json();
+    logsEl.innerHTML = '';
+
+    if (!logs.length) {
+      logsEl.innerHTML = '<p class="small-text">No logs yet.</p>';
+      return;
+    }
+
+    logs.slice().reverse().forEach(log => {
+      const div = document.createElement('div');
+      div.className = 'log-item';
+      const ts = new Date(log.timestamp).toLocaleString();
+      div.innerHTML = `
+        <div><strong>${log.commandName}</strong> by ${log.username || log.userId}</div>
+        <div class="small-text">${ts} · Guild: ${log.guildId || 'DM'} · Channel: ${log.channelId || 'N/A'}</div>
+      `;
+      logsEl.appendChild(div);
+    });
+  } catch (err) {
+    console.error(err);
+  }
+}
+
+// ---------- Admin: add admin ----------
+const addAdminForm = document.getElementById('add-admin-form');
+addAdminForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const id = document.getElementById('new-admin-id').value.trim();
+  if (!id) return;
+  try {
+    const res = await fetch('/api/admin/add-admin', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: id }),
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      alert(err.error || 'Failed to add admin');
+      return;
+    }
+    document.getElementById('new-admin-id').value = '';
+    alert('Admin added.');
+  } catch (err) {
+    console.error(err);
+  }
+});
+
+// ---------- Admin: manual commands ("Sync & Fix") ----------
+const manualForm = document.getElementById('manual-command-form');
+manualForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const name = document.getElementById('mc-name').value.trim();
+  const desc = document.getElementById('mc-desc').value.trim();
+  const perms = document.getElementById('mc-perms').value.trim();
+  const dm = document.getElementById('mc-dm').checked;
+
+  if (!name) return;
+
+  try {
+    const res = await fetch('/api/admin/manual-command', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name,
+        description: desc,
+        permissions: perms || null,
+        dm_permission: dm,
+      }),
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      alert(err.error || 'Failed to add command');
+      return;
+    }
+    document.getElementById('mc-name').value = '';
+    document.getElementById('mc-desc').value = '';
+    document.getElementById('mc-perms').value = '';
+    document.getElementById('mc-dm').checked = true;
+
+    await loadCommands(); // refresh list to show manual entry
+  } catch (err) {
+    console.error(err);
+  }
+});
+
+// ---------- Admin: guild list ----------
+const guildsListEl = document.getElementById('guilds-list');
+
+async function loadGuilds() {
+  try {
+    const res = await fetch('/api/admin/guilds', { credentials: 'include' });
+    if (!res.ok) return;
+    const guilds = await res.json();
+
+    guildsListEl.innerHTML = '';
+    if (!guilds.length) {
+      guildsListEl.innerHTML = '<p class="small-text">Bot is not in any guilds.</p>';
+      return;
+    }
+
+    guilds.forEach(g => {
+      const row = document.createElement('div');
+      row.className = 'guild-row';
+
+      const main = document.createElement('div');
+      main.className = 'guild-main';
+      main.innerHTML = `
+        <div><strong>${g.name}</strong></div>
+        <div class="guild-meta">
+          Owner: ${g.owner ? `${g.owner.tag} (${g.owner.id})` : 'Unknown'} ·
+          Roles: ${g.roleCount} ·
+          ID: ${g.id}
+        </div>
+      `;
+
+      const moreBtn = document.createElement('button');
+      moreBtn.className = 'btn ghost tiny';
+      moreBtn.textContent = 'More';
+
+      const rolesContainer = document.createElement('div');
+      rolesContainer.className = 'guild-roles hidden';
+      rolesContainer.textContent = 'Loading roles…';
+
+      moreBtn.addEventListener('click', async () => {
+        const isHidden = rolesContainer.classList.contains('hidden');
+        if (isHidden) {
+          // fetch roles
+          rolesContainer.classList.remove('hidden');
+          rolesContainer.textContent = 'Loading roles…';
+          try {
+            const res = await fetch(`/api/admin/guilds/${g.id}/roles`, { credentials: 'include' });
+            const roles = await res.json();
+            if (!Array.isArray(roles)) {
+              rolesContainer.textContent = 'Failed to load roles.';
+              return;
+            }
+
+            rolesContainer.innerHTML = '';
+            roles.forEach(r => {
+              const pill = document.createElement('span');
+              pill.className = 'role-pill';
+              const color = document.createElement('span');
+              color.className = 'role-color-square';
+              color.style.backgroundColor = r.color;
+              const text = document.createElement('span');
+              text.textContent = `${r.name} (${r.id}) · ${r.color}`;
+              pill.appendChild(color);
+              pill.appendChild(text);
+              rolesContainer.appendChild(pill);
+            });
+          } catch (err) {
+            console.error(err);
+            rolesContainer.textContent = 'Failed to load roles.';
+          }
+        } else {
+          rolesContainer.classList.add('hidden');
+        }
+      });
+
+      row.appendChild(main);
+      row.appendChild(moreBtn);
+
+      const wrapper = document.createElement('div');
+      wrapper.appendChild(row);
+      wrapper.appendChild(rolesContainer);
+
+      guildsListEl.appendChild(wrapper);
+    });
+  } catch (err) {
+    console.error(err);
+  }
+}
+
+// ---------- Kick everything off ----------
+loadBotInfo();
+loadCommands();
+refreshAuthUI();
+
+8. Hooking your bot into the command log
+
+In your existing bot code (where you handle interactions), you can POST to the dashboard:
+
+// Example for a slash command handler
+import fetch from 'node-fetch';
+
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+
+  // log command to dashboard
+  try {
+    await fetch('http://localhost:3000/api/bot/command-log', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      // add a shared secret in headers or body, and verify in server.js
+      body: JSON.stringify({
+        userId: interaction.user.id,
+        username: interaction.user.tag,
+        commandName: interaction.commandName,
+        options: interaction.options.data,
+        guildId: interaction.guildId,
+        channelId: interaction.channelId,
+      }),
+    });
+  } catch (e) {
+    console.error('Failed to send command log:', e);
+  }
+
+  // …rest of your command handling
+});
+
+9. Matching Nobleprac’s font
+
+I couldn’t reliably detect Nobleprac’s exact font from here, but you can:
+
+Open nobleprac.com in your browser.
+
+Right-click any text → Inspect.
+
+In DevTools → Computed → look at font-family.
+
+Import that font in <head> (Google Fonts / Adobe / CSS @font-face) and replace the font-family in styles.css.
